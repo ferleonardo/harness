@@ -1,88 +1,111 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # ralph.sh
 #
-# Orquestrador que le .spec/project-phases.md, quebra em fases,
-# e alimenta cada uma ao Codex CLI ou Claude Code para implementacao automatica.
+# Orquestrador que le um documento de fases, quebra em fases, e alimenta cada
+# uma ao Codex CLI ou Claude Code para implementacao automatica.
 #
-# Agnostico de stack: a fase e o CLAUDE.md do projeto definem linguagem,
-# framework, comandos e convencoes. O prompt nao assume nenhuma stack.
+# Invariantes:
+#   1. Cada fase E cada ciclo de correcao roda em sessao NOVA, com prompt
+#      auto-contido. Nunca reutiliza sessao.
+#   2. Zero perguntas. Do inicio ao fim sem interacao humana.
+#   3. Fase so e "completa" quando passa por 4 gates mecanicos, nunca pelo
+#      exit code do engine.
+#   4. Limite de uso -> espera o reset e re-executa a MESMA fase, sem consumir
+#      ciclo de correcao.
+#   5. Um commit por fase concluida.
+#
+# Agnostico de stack: a fase e o CLAUDE.md/AGENTS.md do projeto definem
+# linguagem, framework, comandos e convencoes.
 #
 # Uso:
-#   chmod +x ralph.sh
-#   ./ralph.sh [--engine codex|claude] [--from N] [caminho-do-arquivo]
+#   ./ralph.sh [opcoes] [caminho-do-arquivo]
 #
-# Exemplos:
-#   ./ralph.sh                          # default: codex, comeca na fase 1
-#   ./ralph.sh --engine claude          # usa Claude Code
-#   ./ralph.sh --from 5                 # comeca a partir da fase 5
-#   ./ralph.sh --engine codex --from 3 .spec/project-phases.md
+# Opcoes:
+#   --engine codex|claude    engine de implementacao (default: codex)
+#   --from N                 comeca na fase N (limpa do progresso as fases >= N)
+#   --keep-going             continua apos uma fase falhar (default: para)
+#   --max-cycles N           ciclos de correcao por fase (default: 3)
+#   --test-cmd "<cmd>"       comando de teste do projeto (gate 2)
 #
-# Comportamento em limite de uso:
-#   Se o engine atingir o limite de uso (usage/rate limit), o script detecta
-#   na saida, calcula o horario de reset (quando disponivel) ou aguarda um
-#   fallback de 30 min, dorme, e re-executa a MESMA fase automaticamente sem
-#   consumir uma tentativa de retry.
+# Input (primeiro arquivo posicional). Sem argumento, resolve nesta ordem:
+#   1. .spec/init/project-phases.md      (cadeia init)
+#   2. .spec/project-phases.md           (repos pre-init, com aviso)
+#
+#   Um PHASES.md de feature tambem e input valido:
+#     ./ralph.sh .spec/features/<slug>/PHASES.md
+#
+# Contrato de formato do input (validado no preflight):
+#   - >= 1 heading `## Phase N: <titulo>`
+#   - nenhum heading `## Phase ...` fora desse formato
+#   - sub-fases em `### Phase N.M:` (nao viram sessao propria)
+#   - qualquer outro `## ` encerra a captura da fase anterior
+#
+# Gates por fase (todos verdes -> commit; qualquer vermelho -> ciclo de correcao):
+#   0. engine terminou de verdade (claude: is_error no JSON; codex: exit code)
+#   1. diff nao vazio (alguem escreveu codigo)
+#   2. suite de testes do projeto, rodada PELO ralph (fora da sessao do agente)
+#   3. sessao verificadora independente, read-only, task a task
+#
+# Variaveis de ambiente:
+#   RALPH_TEST_CMD           comando de teste (gate 2); --test-cmd tem prioridade
+#   RALPH_MAX_CYCLES         ciclos de correcao por fase (default: 3)
+#   RALPH_MAX_LIMIT_WAITS    esperas consecutivas por limite, por fase (default: 20)
+#   RALPH_LIMIT_WAIT_DEFAULT fallback de espera em segundos (default: 1800)
+#   RALPH_LIMIT_BUFFER       segundos extras apos o reset (default: 60)
+#
+# Exportadas para hooks (ex: notify-n8n.sh) durante cada sessao de engine:
+#   RALPH_ENGINE             codex | claude
+#   RALPH_PHASE_TITLE        titulo da fase corrente
+#   RALPH_PHASE_NUM          numero da fase corrente
+#   RALPH_PHASE_TOTAL        total de fases do run
+#   RALPH_PHASE_ATTEMPT      ciclo corrente (1 = implementacao inicial)
+#   RALPH_PHASE_MAX_ATTEMPTS igual a RALPH_MAX_CYCLES
+#
+# Exit code: 0 = todas as fases verdes; 1 = alguma falhou ou abortou.
 #
 # Pre-requisitos:
 #   - Codex: npm install -g @openai/codex + OPENAI_API_KEY
 #   - Claude: npm install -g @anthropic-ai/claude-code + ANTHROPIC_API_KEY
-#   - Estar na raiz do projeto (dentro de um repo git)
-#   - Pasta .spec/ com os documentos do projeto (project-phases.md, etc.)
+#   - Raiz de um repo git, com a arvore de trabalho limpa
 
 set -euo pipefail
 
 ENGINE="codex"
 INPUT_FILE=""
 FROM_PHASE=0
+KEEP_GOING=false
+TEST_CMD_FLAG=""
+MAX_CYCLES="${RALPH_MAX_CYCLES:-3}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --engine)
-      ENGINE="$2"
-      shift 2
-      ;;
-    --engine=*)
-      ENGINE="${1#*=}"
-      shift
-      ;;
-    --from)
-      FROM_PHASE="$2"
-      shift 2
-      ;;
-    --from=*)
-      FROM_PHASE="${1#*=}"
-      shift
-      ;;
-    *)
-      INPUT_FILE="$1"
-      shift
-      ;;
+    --engine)      ENGINE="$2"; shift 2 ;;
+    --engine=*)    ENGINE="${1#*=}"; shift ;;
+    --from)        FROM_PHASE="$2"; shift 2 ;;
+    --from=*)      FROM_PHASE="${1#*=}"; shift ;;
+    --max-cycles)  MAX_CYCLES="$2"; shift 2 ;;
+    --max-cycles=*) MAX_CYCLES="${1#*=}"; shift ;;
+    --test-cmd)    TEST_CMD_FLAG="$2"; shift 2 ;;
+    --test-cmd=*)  TEST_CMD_FLAG="${1#*=}"; shift ;;
+    --keep-going)  KEEP_GOING=true; shift ;;
+    -h|--help)     sed -n '2,60p' "$0"; exit 0 ;;
+    *)             INPUT_FILE="$1"; shift ;;
   esac
 done
-
-INPUT_FILE="${INPUT_FILE:-.spec/project-phases.md}"
-
-if [[ "$ENGINE" != "codex" && "$ENGINE" != "claude" ]]; then
-  echo "Engine invalida: $ENGINE. Use 'codex' ou 'claude'."
-  exit 1
-fi
-
-if ! [[ "$FROM_PHASE" =~ ^[0-9]+$ ]]; then
-  echo "Valor invalido para --from: '$FROM_PHASE'. Use um numero inteiro (ex: --from 5)."
-  exit 1
-fi
 
 PHASES_DIR=".phases"
 LOG_DIR=".phases/logs"
 PROMPT_DIR=".phases/prompts"
 MANIFEST="$PHASES_DIR/manifest.txt"
 PROGRESS_FILE="$PHASES_DIR/.progress"
-MAX_RETRIES=2
 
-# Configuracao de espera por limite de uso
-LIMIT_WAIT_DEFAULT=1800   # fallback: 30 min quando nao ha horario de reset
-LIMIT_BUFFER=60           # segundos extras apos o reset, por seguranca
+MAX_LIMIT_WAITS="${RALPH_MAX_LIMIT_WAITS:-20}"
+LIMIT_WAIT_DEFAULT="${RALPH_LIMIT_WAIT_DEFAULT:-1800}"
+LIMIT_BUFFER="${RALPH_LIMIT_BUFFER:-60}"
+
+TEST_CMD=""
+LIMIT_WAITS=0
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -98,41 +121,127 @@ fail()    { echo -e "${RED}[$(date '+%H:%M:%S')] $1${NC}"; }
 format_duration() {
   local total_seconds=$1
   local hours=$((total_seconds / 3600))
-  local minutes=$(( (total_seconds % 3600) / 60 ))
+  local minutes=$(((total_seconds % 3600) / 60))
   local seconds=$((total_seconds % 60))
 
-  if [ $hours -gt 0 ]; then
-    printf "%dh %dm %ds" $hours $minutes $seconds
-  elif [ $minutes -gt 0 ]; then
-    printf "%dm %ds" $minutes $seconds
+  if [ "$hours" -gt 0 ]; then
+    printf "%dh %dm %ds" "$hours" "$minutes" "$seconds"
+  elif [ "$minutes" -gt 0 ]; then
+    printf "%dm %ds" "$minutes" "$seconds"
   else
-    printf "%ds" $seconds
+    printf "%ds" "$seconds"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+
+resolve_input_file() {
+  if [ -n "$INPUT_FILE" ]; then
+    return 0
+  fi
+
+  if [ -f ".spec/init/project-phases.md" ]; then
+    INPUT_FILE=".spec/init/project-phases.md"
+  elif [ -f ".spec/project-phases.md" ]; then
+    INPUT_FILE=".spec/project-phases.md"
+    warn "Usando .spec/project-phases.md (layout pre-init). O padrao atual e .spec/init/project-phases.md."
+  else
+    fail "Nenhum documento de fases encontrado."
+    fail "Esperado .spec/init/project-phases.md (rode /init:project-phases) ou passe o caminho como argumento."
+    exit 1
+  fi
+}
+
+validate_input_format() {
+  local top_level
+  top_level=$(grep -cE '^## Phase [0-9]+: ' "$INPUT_FILE" || true)
+
+  if [ "$top_level" -lt 1 ]; then
+    fail "Contrato de formato violado: nenhum heading '## Phase N: <titulo>' em $INPUT_FILE"
+    fail "ralph quebra o documento por esse heading. Corrija o documento antes de rodar."
+    exit 1
+  fi
+
+  local malformed
+  malformed=$(grep -E '^## Phase' "$INPUT_FILE" | grep -vE '^## Phase [0-9]+: ' || true)
+  if [ -n "$malformed" ]; then
+    fail "Contrato de formato violado: headings '## Phase' fora do formato '## Phase N: <titulo>':"
+    echo "$malformed" | sed 's/^/    /'
+    fail "Uma fase com heading torto some silenciosamente do run. Corrija antes de gastar tokens."
+    exit 1
+  fi
+
+  log "Formato do input OK ($top_level fases declaradas)"
+}
+
+exclude_phases_dir() {
+  local exclude_file
+  exclude_file="$(git rev-parse --git-dir)/info/exclude"
+  mkdir -p "$(dirname "$exclude_file")"
+  if ! grep -qxF '/.phases/' "$exclude_file" 2>/dev/null; then
+    echo '/.phases/' >> "$exclude_file"
+    log "Registrado /.phases/ em .git/info/exclude (nao mexe no .gitignore do projeto)"
+  fi
+}
+
+resolve_test_cmd() {
+  if [ -n "$TEST_CMD_FLAG" ]; then
+    TEST_CMD="$TEST_CMD_FLAG"
+    log "Gate 2 — comando de teste (--test-cmd): $TEST_CMD"
+    return 0
+  fi
+
+  if [ -n "${RALPH_TEST_CMD:-}" ]; then
+    TEST_CMD="$RALPH_TEST_CMD"
+    log "Gate 2 — comando de teste (RALPH_TEST_CMD): $TEST_CMD"
+    return 0
+  fi
+
+  if [ -f composer.json ] && grep -qE '"test"[[:space:]]*:' composer.json; then
+    TEST_CMD="composer test"
+  elif [ -f package.json ] && grep -qE '"test"[[:space:]]*:' package.json; then
+    TEST_CMD="npm test"
+  elif [ -f pytest.ini ] || { [ -f pyproject.toml ] && grep -qF '[tool.pytest' pyproject.toml; }; then
+    TEST_CMD="pytest"
+  elif [ -f go.mod ]; then
+    TEST_CMD="go test ./..."
+  elif [ -f Cargo.toml ]; then
+    TEST_CMD="cargo test"
+  fi
+
+  if [ -n "$TEST_CMD" ]; then
+    log "Gate 2 — comando de teste (detectado): $TEST_CMD"
+  else
+    warn "Gate 2 DESABILITADO: nenhum comando de teste resolvido."
+    warn "Passe --test-cmd '<cmd>' ou defina RALPH_TEST_CMD. O gate 3 (verificador) segue ativo."
   fi
 }
 
 preflight_checks() {
-  if [[ "$ENGINE" == "codex" ]]; then
-    if ! command -v codex &> /dev/null; then
-      fail "codex CLI nao encontrado. Instale com: npm install -g @openai/codex"
-      exit 1
-    fi
-  elif [[ "$ENGINE" == "claude" ]]; then
-    if ! command -v claude &> /dev/null; then
-      fail "Claude Code CLI nao encontrado. Instale com: npm install -g @anthropic-ai/claude-code"
-      exit 1
-    fi
-  fi
-
-  if [ ! -f "$INPUT_FILE" ]; then
-    fail "Arquivo nao encontrado: $INPUT_FILE"
+  if [[ "$ENGINE" != "codex" && "$ENGINE" != "claude" ]]; then
+    fail "Engine invalida: $ENGINE. Use 'codex' ou 'claude'."
     exit 1
   fi
 
-  if [ ! -d ".spec" ] && [ ! -f "CLAUDE.md" ]; then
-    warn "Nao parece ser a raiz do projeto (.spec/ e CLAUDE.md ausentes)"
-    read -p "Continuar mesmo assim? (y/N) " -n 1 -r
-    echo
-    [[ $REPLY =~ ^[Yy]$ ]] || exit 1
+  if ! [[ "$FROM_PHASE" =~ ^[0-9]+$ ]]; then
+    fail "Valor invalido para --from: '$FROM_PHASE'. Use um numero inteiro (ex: --from 5)."
+    exit 1
+  fi
+
+  if ! [[ "$MAX_CYCLES" =~ ^[0-9]+$ ]] || [ "$MAX_CYCLES" -lt 1 ]; then
+    fail "Valor invalido para --max-cycles: '$MAX_CYCLES'. Use um inteiro >= 1."
+    exit 1
+  fi
+
+  if ! command -v "$ENGINE" &> /dev/null; then
+    if [[ "$ENGINE" == "codex" ]]; then
+      fail "codex CLI nao encontrado. Instale com: npm install -g @openai/codex"
+    else
+      fail "Claude Code CLI nao encontrado. Instale com: npm install -g @anthropic-ai/claude-code"
+    fi
+    exit 1
   fi
 
   if ! git rev-parse --is-inside-work-tree &> /dev/null 2>&1; then
@@ -140,43 +249,85 @@ preflight_checks() {
     exit 1
   fi
 
-  success "Pre-checks OK (engine: $ENGINE)"
+  resolve_input_file
+
+  if [ ! -f "$INPUT_FILE" ]; then
+    fail "Arquivo nao encontrado: $INPUT_FILE"
+    exit 1
+  fi
+
+  validate_input_format
+  exclude_phases_dir
+
+  # Arvore limpa: 'git add -A' da primeira fase engoliria trabalho nao commitado.
+  if [ -n "$(git status --porcelain)" ]; then
+    fail "Arvore de trabalho suja. ralph commita por fase e engoliria suas mudancas."
+    fail "Commite ou stashe antes de rodar:"
+    git status --short | sed 's/^/    /'
+    exit 1
+  fi
+
+  resolve_test_cmd
+
+  success "Pre-checks OK (engine: $ENGINE, input: $INPUT_FILE)"
 }
+
+# ---------------------------------------------------------------------------
+# Split + progresso
+# ---------------------------------------------------------------------------
+
+manifest_entries() { grep -v '^#' "$MANIFEST" || true; }
 
 split_phases() {
   log "Quebrando $INPUT_FILE em fases..."
 
+  local new_stamp old_stamp="" progress_backup=""
+  new_stamp="$(basename "$INPUT_FILE")@sha256:$(sha256sum "$INPUT_FILE" | cut -c1-12)"
+
+  if [ -f "$MANIFEST" ]; then
+    old_stamp=$(sed -n '1s/^# stamp: //p' "$MANIFEST")
+  fi
+  if [ -f "$PROGRESS_FILE" ]; then
+    progress_backup=$(cat "$PROGRESS_FILE")
+  fi
+
   rm -rf "$PHASES_DIR"
   mkdir -p "$PHASES_DIR" "$LOG_DIR" "$PROMPT_DIR"
-  > "$MANIFEST"
+
+  # Progresso sobrevive entre execucoes, mas so vale para o MESMO input.
+  if [ -n "$progress_backup" ]; then
+    if [ -n "$old_stamp" ] && [ "$old_stamp" = "$new_stamp" ]; then
+      printf '%s\n' "$progress_backup" > "$PROGRESS_FILE"
+      log "Progresso anterior preservado (input inalterado)"
+    else
+      warn "O documento de fases mudou desde a ultima execucao — progresso zerado."
+      warn "Fases marcadas como feitas pertenciam a outro plano."
+    fi
+  fi
+
+  echo "# stamp: $new_stamp" > "$MANIFEST"
 
   local current_file=""
   local phase_count=0
 
   while IFS= read -r line || [ -n "$line" ]; do
-    if [[ "$line" =~ ^##[[:space:]]+(Phase[[:space:]]+[0-9]+[^#]*) ]]; then
+    if [[ "$line" =~ ^##[[:space:]]+Phase[[:space:]]+([0-9]+):[[:space:]]*(.*)$ ]]; then
       phase_count=$((phase_count + 1))
 
-      local raw_title="${BASH_REMATCH[1]}"
-      raw_title="$(echo "$raw_title" | sed 's/[[:space:]]*$//')"
+      local phase_num="${BASH_REMATCH[1]}"
+      local phase_title="${BASH_REMATCH[2]}"
+      phase_title="$(echo "$phase_title" | sed 's/[[:space:]]*$//')"
 
       local slug
-      slug=$(echo "$raw_title" \
-        | tr '[:upper:]' '[:lower:]' \
-        | sed 's/phase[[:space:]]*/phase-/' \
-        | sed 's/[^a-z0-9-]/-/g' \
-        | sed 's/--*/-/g' \
-        | sed 's/-$//' \
-        | sed 's/^-//')
-      slug=$(echo "$slug" | sed -E 's/phase-([0-9])$/phase-0\1/' | sed -E 's/phase-([0-9])-/phase-0\1-/')
+      slug=$(printf 'phase-%02d' "$phase_num")
 
       current_file="$PHASES_DIR/${slug}.md"
       echo "$line" > "$current_file"
-      echo "${slug}.md|${raw_title}" >> "$MANIFEST"
+      echo "${slug}.md|${phase_num}|${phase_title}" >> "$MANIFEST"
       continue
     fi
 
-    # Heading nivel 2 que nao e "## Phase N" (ex: "## Open Questions"):
+    # Heading nivel 2 que nao e "## Phase N:" (ex: "## Open Questions"):
     # encerra a captura para nao vazar a secao para a ultima fase.
     if [[ "$line" =~ ^##[[:space:]] ]]; then
       current_file=""
@@ -191,24 +342,60 @@ split_phases() {
   success "$phase_count fases extraidas"
 }
 
-build_prompt_file() {
+is_phase_done() {
   local phase_file="$1"
-  local prompt_file="$PROMPT_DIR/${phase_file%.md}.txt"
+  [ -f "$PROGRESS_FILE" ] && grep -qxF "$phase_file" "$PROGRESS_FILE"
+}
 
-  cat > "$prompt_file" <<PROMPT
-Voce e um desenvolvedor senior implementando uma fase deste projeto.
+mark_phase_done() {
+  echo "$1" >> "$PROGRESS_FILE"
+}
 
+# --from N tambem limpa do progresso as fases >= N (re-rodar de proposito).
+apply_from_override() {
+  [ "$FROM_PHASE" -gt 1 ] || return 0
+  [ -f "$PROGRESS_FILE" ] || return 0
+
+  local kept="" file num _rest
+  while IFS='|' read -r file num _rest; do
+    if [ "$num" -lt "$FROM_PHASE" ] && grep -qxF "$file" "$PROGRESS_FILE"; then
+      kept+="$file"$'\n'
+    fi
+  done < <(manifest_entries)
+
+  printf '%s' "$kept" > "$PROGRESS_FILE"
+  log "--from $FROM_PHASE: progresso das fases >= $FROM_PHASE limpo"
+}
+
+# ---------------------------------------------------------------------------
+# Prompts (auto-contidos — cada sessao e nova)
+# ---------------------------------------------------------------------------
+
+context_preamble() {
+  cat <<'PREAMBLE'
 ## Descubra a stack e as convencoes antes de escrever codigo
 Este projeto pode ser de qualquer linguagem ou framework. NAO assuma nenhuma
-stack. Antes de comecar, LEIA nesta ordem:
-1. CLAUDE.md (se existir) — convencoes, comandos e regras do projeto
-2. .spec/project-description.md — descricao geral do projeto
-3. .spec/project-phases.md — plano completo de fases
-4. .spec/user-stories.md — user stories (se existir)
-5. .spec/database-schema.md — modelo de dados (se existir)
-Use os comandos de build, teste e execucao definidos por esses documentos e
-pelo tooling ja presente no repositorio. Se houver ferramenta de memoria/
-contexto configurada (ex: mem0), use-a para entender o historico do projeto.
+stack. Antes de comecar, LEIA os que existirem, nesta ordem:
+1. AGENTS.md ou CLAUDE.md — convencoes, comandos e regras do projeto
+2. .spec/init/project-description.md — descricao geral do projeto
+3. .spec/init/user-stories.md — user stories
+4. .spec/init/database-schema.md — modelo de dados
+5. os documentos citados no proprio texto da fase (ex: SPEC.md/PLAN.md da feature)
+Use os comandos de build, teste e execucao definidos por esses documentos e pelo
+tooling ja presente no repositorio. Se o projeto tiver uma ferramenta de memoria
+ou contexto configurada, use-a para entender o historico.
+PREAMBLE
+}
+
+build_impl_prompt() {
+  local phase_file="$1" cycle="$2"
+  local prompt_file="$PROMPT_DIR/${phase_file%.md}.cycle-${cycle}.txt"
+
+  {
+    echo "Voce e um desenvolvedor senior implementando uma fase deste projeto."
+    echo
+    context_preamble
+    cat <<'TASK'
 
 ## Sua tarefa agora
 Implemente COMPLETAMENTE a fase descrita abaixo.
@@ -221,7 +408,6 @@ Para cada item:
 5. So passe pro proximo item quando os testes passarem
 
 ## Regras obrigatorias
-- LEIA o CLAUDE.md antes de comecar — ele contem as convencoes do projeto
 - Use SEMPRE os comandos, o runner de testes e as ferramentas ja adotados pelo
   projeto (nao introduza uma stack ou ferramenta nova por conta propria)
 - Testes e fixtures/factories devem criar todas as dependencias necessarias
@@ -230,112 +416,188 @@ Para cada item:
 - Ao final, valide que toda a suite de testes da fase passa
 
 ## Fase a implementar
-$(cat "$PHASES_DIR/$phase_file")
-PROMPT
+TASK
+    cat "$PHASES_DIR/$phase_file"
+  } > "$prompt_file"
 
   echo "$prompt_file"
 }
 
-build_retry_prompt_file() {
-  local phase_file="$1"
-  local test_output="$2"
-  local prompt_file="$PROMPT_DIR/${phase_file%.md}-retry.txt"
+# Prompt de correcao: auto-contido. Carrega a fase inteira + a causa REAL
+# da falha (nunca "os testes falharam" generico).
+build_fix_prompt() {
+  local phase_file="$1" cycle="$2" gate="$3" cause="$4"
+  local prompt_file="$PROMPT_DIR/${phase_file%.md}.cycle-${cycle}.txt"
 
-  cat > "$prompt_file" <<PROMPT
-Os testes falharam apos a implementacao anterior. Corrija os erros.
+  {
+    echo "Voce e um desenvolvedor senior corrigindo uma fase parcialmente implementada."
+    echo
+    context_preamble
+    cat <<'INTRO'
 
-Saida dos testes:
-\`\`\`
-$test_output
-\`\`\`
+## Situacao
+Uma sessao anterior tentou implementar a fase abaixo e NAO passou na verificacao.
+Voce esta numa sessao nova: nao tem memoria do que foi feito. Leia o codigo atual
+antes de mudar qualquer coisa.
 
-Corrija o codigo para que todos os testes passem. Rode os testes novamente apos cada correcao.
-PROMPT
+## Regras obrigatorias
+- Corrija APENAS o que falta. Nao reimplemente o que ja esta correto e testado.
+- Nao deixe TODOs, placeholders ou testes pulados.
+- Rode a suite de testes do projeto ao final e garanta que ela passa.
+INTRO
+    echo
+    echo "## Motivo da falha ($gate)"
+    echo '```'
+    echo "$cause"
+    echo '```'
+    echo
+    echo "## Fase a completar"
+    cat "$PHASES_DIR/$phase_file"
+  } > "$prompt_file"
 
   echo "$prompt_file"
 }
 
-# Detecta se o log contem indicio de limite de uso atingido.
-# Ecoa o epoch de reset (segundos) se encontrado, "0" para limite generico
-# sem horario. Retorna 0 quando detecta limite, 1 quando nao ha limite.
+build_verify_prompt() {
+  local phase_file="$1" cycle="$2"
+  local prompt_file="$PROMPT_DIR/${phase_file%.md}.verify-${cycle}.txt"
+
+  {
+    cat <<'VERIFY'
+RALPH_VERIFY
+
+Voce e um verificador independente. NAO escreva, edite ou crie nenhum arquivo.
+Seu unico trabalho e ler o codigo real e dizer o que esta feito e o que nao esta.
+
+Para CADA task marcada com `- [ ]` ou `- [x]` na fase abaixo, na ordem em que
+aparecem, confira os acceptance criteria contra o codigo real (arquivos, classes,
+testes, rotas, migrations — o que a task exigir) e emita EXATAMENTE UMA linha:
+
+TASK <n>: DONE
+TASK <n>: INCOMPLETE — <o que falta>
+
+Regras:
+- <n> e o indice da task na fase, comecando em 1.
+- Uma linha TASK para cada task, sem excecao, sem agrupar.
+- Nao emita nenhum outro texto alem das linhas TASK.
+- Codigo ausente, TODO, placeholder ou teste faltando => INCOMPLETE.
+- Na duvida, INCOMPLETE.
+
+## Fase a verificar
+VERIFY
+    cat "$PHASES_DIR/$phase_file"
+  } > "$prompt_file"
+
+  echo "$prompt_file"
+}
+
+# ---------------------------------------------------------------------------
+# Limite de uso (item 5) — so olha o FIM do log, com padroes por engine
+# ---------------------------------------------------------------------------
+
+# Ecoa o epoch de reset se encontrado, "0" para limite sem horario.
+# Retorna 0 quando detecta limite, 1 quando nao ha limite.
 detect_usage_limit() {
   local log_file="$1"
+  local tail_txt pattern epoch
 
-  if ! grep -qiE 'usage limit reached|rate.?limit|too many requests|(^|[^0-9])429([^0-9]|$)|limit reached.*reset|quota exceeded|please try again later|retry after' "$log_file"; then
-    return 1
+  # A mensagem de limite sai no FIM da execucao. Olhar o log inteiro faz output
+  # de teste do projeto ("429", "Too Many Requests") disparar espera de 30min.
+  tail_txt=$(tail -n 20 "$log_file" 2>/dev/null || true)
+
+  if [[ "$ENGINE" == "claude" ]]; then
+    pattern='usage limit reached'
+  else
+    pattern='rate limit reached|quota exceeded|usage limit reached'
   fi
 
-  # Claude Code costuma emitir: "Claude AI usage limit reached|<epoch>"
-  local epoch
-  epoch=$(grep -oiE 'usage limit reached[^0-9]*[0-9]{10,13}' "$log_file" \
-    | grep -oE '[0-9]{10,13}' | tail -1)
+  grep -qiE "$pattern" <<< "$tail_txt" || return 1
 
-  # Fallback: qualquer "reset(s) at <epoch>" ou "resets ... <epoch>"
+  epoch=$(grep -oiE 'usage limit reached[^0-9]*[0-9]{10,13}' <<< "$tail_txt" \
+    | grep -oE '[0-9]{10,13}' | tail -1 || true)
+
   if [ -z "$epoch" ]; then
-    epoch=$(grep -oiE 'reset[a-z ]*[0-9]{10,13}' "$log_file" \
-      | grep -oE '[0-9]{10,13}' | tail -1)
+    epoch=$(grep -oiE 'reset[a-z ]*[0-9]{10,13}' <<< "$tail_txt" \
+      | grep -oE '[0-9]{10,13}' | tail -1 || true)
   fi
 
   echo "${epoch:-0}"
   return 0
 }
 
-# Dorme ate o horario de reset (ou fallback), mostrando contagem regressiva.
 wait_for_reset() {
   local epoch="$1"
   local now wait_secs
   now=$(date +%s)
 
+  LIMIT_WAITS=$((LIMIT_WAITS + 1))
+  if [ "$LIMIT_WAITS" -gt "$MAX_LIMIT_WAITS" ]; then
+    fail "Limite de uso atingido $LIMIT_WAITS vezes seguidas nesta fase (cap: $MAX_LIMIT_WAITS)."
+    fail "Abortando em vez de dormir indefinidamente."
+    exit 1
+  fi
+
   if [[ "$epoch" =~ ^[0-9]+$ ]] && [ "$epoch" -gt 0 ]; then
-    # Normaliza epoch em milissegundos para segundos
     if [ "${#epoch}" -ge 13 ]; then
       epoch=$((epoch / 1000))
     fi
     wait_secs=$((epoch - now + LIMIT_BUFFER))
-    if [ $wait_secs -lt $LIMIT_BUFFER ]; then
+    if [ "$wait_secs" -lt "$LIMIT_BUFFER" ]; then
       wait_secs=$LIMIT_BUFFER
     fi
-    warn "Limite de uso atingido. Reset previsto para $(date -d @$epoch '+%d/%m %H:%M:%S')."
+    warn "Limite de uso atingido. Reset previsto para $(date -d "@$epoch" '+%d/%m %H:%M:%S')."
   else
     wait_secs=$LIMIT_WAIT_DEFAULT
     warn "Limite de uso atingido. Sem horario de reset no output; aguardando fallback."
   fi
 
-  warn "Aguardando $(format_duration $wait_secs) ate retomar a mesma fase..."
+  warn "Espera $LIMIT_WAITS/$MAX_LIMIT_WAITS — aguardando $(format_duration "$wait_secs") ate retomar a MESMA fase..."
 
-  local remaining=$wait_secs
-  while [ $remaining -gt 0 ]; do
-    local chunk=60
-    [ $remaining -lt 60 ] && chunk=$remaining
-    sleep $chunk
+  local remaining=$wait_secs chunk
+  while [ "$remaining" -gt 0 ]; do
+    chunk=60
+    [ "$remaining" -lt 60 ] && chunk=$remaining
+    sleep "$chunk"
     remaining=$((remaining - chunk))
-    [ $remaining -gt 0 ] && log "Retomando em $(format_duration $remaining)..."
+    [ "$remaining" -gt 0 ] && log "Retomando em $(format_duration "$remaining")..."
   done
 
   success "Reset provavelmente concluido. Retomando execucao."
 }
 
+# ---------------------------------------------------------------------------
+# Engine
+# ---------------------------------------------------------------------------
+
+# run_engine <prompt_file> <log_file> <mode: impl|verify>
+# Loop de resiliencia a limite de uso: nao consome ciclo de correcao.
 run_engine() {
-  local prompt_file="$1"
-  local log_file="$2"
+  local prompt_file="$1" log_file="$2" mode="$3"
 
-  # Exporta contexto da fase atual para os hooks (notify-n8n.sh usa quando .message vem vazio)
   export RALPH_ENGINE="$ENGINE"
-  export RALPH_PHASE_TITLE="${RALPH_PHASE_TITLE:-}"
-  export RALPH_PHASE_NUM="${RALPH_PHASE_NUM:-}"
-  export RALPH_PHASE_TOTAL="${RALPH_PHASE_TOTAL:-}"
-  export RALPH_PHASE_ATTEMPT="${RALPH_PHASE_ATTEMPT:-1}"
-  export RALPH_PHASE_MAX_ATTEMPTS="$((MAX_RETRIES + 1))"
+  export RALPH_PHASE_MAX_ATTEMPTS="$MAX_CYCLES"
 
-  # Loop de resiliencia a limite de uso: se o engine bater no limite,
-  # aguarda o reset e re-executa a MESMA fase sem gastar retry.
   while true; do
     local rc=0
 
     if [[ "$ENGINE" == "codex" ]]; then
-      cat "$prompt_file" | codex exec --sandbox danger-full-access - 2>&1 | tee "$log_file" || rc=$?
-    elif [[ "$ENGINE" == "claude" ]]; then
-      env -u CLAUDECODE claude --dangerously-skip-permissions -p "$(cat "$prompt_file")" --output-format text --verbose 2>&1 | tee "$log_file" || rc=$?
+      if [[ "$mode" == "verify" ]]; then
+        codex exec --sandbox read-only - < "$prompt_file" 2>&1 | tee "$log_file" || rc=$?
+      else
+        codex exec --sandbox danger-full-access - < "$prompt_file" 2>&1 | tee "$log_file" || rc=$?
+      fi
+    else
+      if [[ "$mode" == "verify" ]]; then
+        env -u CLAUDECODE claude --dangerously-skip-permissions \
+          -p "$(cat "$prompt_file")" \
+          --allowedTools "Read,Glob,Grep" \
+          --output-format text 2>&1 | tee "$log_file" || rc=$?
+      else
+        # JSON: o exit code do CLI e sinal fraco; o gate 0 le is_error.
+        env -u CLAUDECODE claude --dangerously-skip-permissions \
+          -p "$(cat "$prompt_file")" \
+          --output-format json 2>&1 | tee "$log_file" || rc=$?
+      fi
     fi
 
     local reset_epoch
@@ -344,88 +606,246 @@ run_engine() {
       continue
     fi
 
-    return $rc
+    return "$rc"
   done
 }
 
+# ---------------------------------------------------------------------------
+# Gates
+# ---------------------------------------------------------------------------
+
+# Gate 0 — o engine terminou de verdade?
+# Preenche GATE_CAUSE quando vermelho.
+GATE_CAUSE=""
+
+gate0_engine_finished() {
+  local log_file="$1" rc="$2"
+
+  if [[ "$ENGINE" == "claude" ]]; then
+    if ! grep -qF '"type":"result"' "$log_file" && ! grep -qF '"type": "result"' "$log_file"; then
+      GATE_CAUSE="O engine terminou sem emitir um resultado. Ultimas linhas do output:"$'\n'"$(tail -n 40 "$log_file")"
+      return 1
+    fi
+    if grep -qE '"is_error"[[:space:]]*:[[:space:]]*true' "$log_file"; then
+      GATE_CAUSE="O engine reportou is_error=true. Ultimas linhas do output:"$'\n'"$(tail -n 40 "$log_file")"
+      return 1
+    fi
+  fi
+
+  if [ "$rc" -ne 0 ]; then
+    GATE_CAUSE="O engine saiu com codigo $rc. Ultimas linhas do output:"$'\n'"$(tail -n 40 "$log_file")"
+    return 1
+  fi
+
+  return 0
+}
+
+# Assinatura da arvore: rastreados (status + diff) e nao-rastreados (conteudo).
+# Sem mutar o index.
+tree_signature() {
+  {
+    git status --porcelain
+    git diff HEAD
+    git ls-files --others --exclude-standard -z | xargs -0 -r sha256sum 2> /dev/null
+  } 2> /dev/null | sha256sum | cut -c1-16
+}
+
+# Gate 1 — esta sessao escreveu codigo?
+# Duas condicoes: existe mudanca vs HEAD, E a sessao mudou algo (senao um ciclo
+# de correcao herdaria o diff do ciclo anterior e passaria de graca).
+gate1_diff_not_empty() {
+  local sig_before="$1"
+
+  if [ -z "$(git status --porcelain)" ]; then
+    GATE_CAUSE="Nenhuma mudanca foi feita no codigo: a sessao terminou sem escrever nada. Implemente a fase de fato."
+    return 1
+  fi
+
+  if [ "$(tree_signature)" = "$sig_before" ]; then
+    GATE_CAUSE="A sessao terminou sem alterar nenhum arquivo — o codigo esta exatamente como estava antes dela. Corrija o que falta de fato."
+    return 1
+  fi
+
+  return 0
+}
+
+# Gate 2 — a suite do projeto passa, rodada PELO ralph (fora da sessao do agente)?
+gate2_tests_pass() {
+  local test_log="$1"
+
+  if [ -z "$TEST_CMD" ]; then
+    return 0
+  fi
+
+  log "Gate 2 — rodando a suite do projeto: $TEST_CMD"
+  local rc=0
+  bash -c "$TEST_CMD" > "$test_log" 2>&1 || rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    GATE_CAUSE="O comando de teste do projeto ('$TEST_CMD') falhou com codigo $rc. Saida:"$'\n'"$(tail -n 200 "$test_log")"
+    return 1
+  fi
+
+  success "Gate 2 — suite verde"
+  return 0
+}
+
+# Gate 3 — sessao verificadora independente, read-only, task a task.
+gate3_independent_verify() {
+  local phase_file="$1" cycle="$2"
+  local verify_log="$LOG_DIR/${phase_file%.md}.verify-${cycle}.log"
+
+  local expected
+  expected=$(grep -cE '^[[:space:]]*- \[[ x]\]' "$PHASES_DIR/$phase_file" || true)
+
+  if [ "$expected" -eq 0 ]; then
+    warn "Gate 3 pulado: a fase nao declara nenhuma task '- [ ]'"
+    return 0
+  fi
+
+  log "Gate 3 — sessao verificadora independente ($expected tasks)"
+
+  local prompt_file
+  prompt_file=$(build_verify_prompt "$phase_file" "$cycle")
+  run_engine "$prompt_file" "$verify_log" verify || true
+
+  local task_lines
+  task_lines=$(sed 's/^[[:space:]]*//' "$verify_log" | grep -E '^TASK [0-9]+: (DONE|INCOMPLETE)' || true)
+
+  local parsed
+  parsed=$(printf '%s' "$task_lines" | grep -c . || true)
+
+  if [ "$parsed" -eq 0 ]; then
+    GATE_CAUSE="O verificador independente nao emitiu nenhuma linha 'TASK <n>: DONE|INCOMPLETE' — nao foi possivel confirmar que a fase esta completa. Ultimas linhas do verificador:"$'\n'"$(tail -n 40 "$verify_log")"
+    return 1
+  fi
+
+  if [ "$parsed" -ne "$expected" ]; then
+    GATE_CAUSE="O verificador cobriu $parsed de $expected tasks — cobertura incompleta. Linhas emitidas:"$'\n'"$task_lines"
+    return 1
+  fi
+
+  local incomplete
+  incomplete=$(printf '%s\n' "$task_lines" | grep 'INCOMPLETE' || true)
+
+  if [ -n "$incomplete" ]; then
+    GATE_CAUSE="O verificador independente encontrou tasks incompletas:"$'\n'"$incomplete"
+    return 1
+  fi
+
+  success "Gate 3 — $parsed/$expected tasks confirmadas no codigo"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Execucao de fase
+# ---------------------------------------------------------------------------
+
+commit_phase() {
+  local phase_num="$1" phase_title="$2"
+  git add -A
+  if git diff --cached --quiet; then
+    fail "Nada para commitar apos os gates — estado inesperado."
+    return 1
+  fi
+  git commit -q -m "feat(phase-${phase_num}): ${phase_title}"
+  log "Commit criado: feat(phase-${phase_num}): ${phase_title}"
+}
+
+commit_wip() {
+  local phase_num="$1"
+  [ -n "$(git status --porcelain)" ] || return 0
+  git add -A
+  git commit -q -m "wip(phase-${phase_num}): incomplete — see .phases/logs/"
+  warn "Commit wip criado para a fase $phase_num — a proxima fase parte de arvore limpa"
+}
+
+# run_phase <phase_file> <phase_num> <phase_title> <seq> <total>
 run_phase() {
-  local phase_file="$1"
-  local phase_title="$2"
-  local phase_num="$3"
-  local total_phases="$4"
-  local log_file="$LOG_DIR/${phase_file%.md}.log"
+  local phase_file="$1" phase_num="$2" phase_title="$3" seq="$4" total="$5"
   local phase_start
   phase_start=$(date +%s)
 
   export RALPH_PHASE_TITLE="$phase_title"
   export RALPH_PHASE_NUM="$phase_num"
-  export RALPH_PHASE_TOTAL="$total_phases"
+  export RALPH_PHASE_TOTAL="$total"
+
+  LIMIT_WAITS=0
+  GATE_CAUSE=""
 
   echo ""
-  log "[$phase_num/$total_phases] $phase_title"
+  log "[$seq/$total] Phase $phase_num: $phase_title"
 
-  local attempt=0
-  local phase_success=false
+  local cycle=1
+  while [ "$cycle" -le "$MAX_CYCLES" ]; do
+    export RALPH_PHASE_ATTEMPT="$cycle"
+    [ "$cycle" -gt 1 ] && warn "Ciclo de correcao $cycle/$MAX_CYCLES..."
 
-  while [ $attempt -le $MAX_RETRIES ]; do
-    attempt=$((attempt + 1))
-    export RALPH_PHASE_ATTEMPT="$attempt"
+    local prompt_file log_file rc=0 sig_before
+    log_file="$LOG_DIR/${phase_file%.md}.cycle-${cycle}.log"
 
-    if [ $attempt -gt 1 ]; then
-      warn "Tentativa $attempt/$((MAX_RETRIES + 1))..."
-    fi
-
-    local prompt_file
-    if [ $attempt -eq 1 ]; then
-      prompt_file=$(build_prompt_file "$phase_file")
-    fi
-
-    if run_engine "$prompt_file" "$log_file"; then
-      phase_success=true
-      break
+    if [ "$cycle" -eq 1 ]; then
+      prompt_file=$(build_impl_prompt "$phase_file" "$cycle")
     else
-      fail "$ENGINE retornou erro"
-      if [ $attempt -le $MAX_RETRIES ]; then
-        local test_output
-        test_output=$(tail -30 "$log_file" 2>/dev/null || echo "Sem output disponivel")
-        prompt_file=$(build_retry_prompt_file "$phase_file" "$test_output")
-      fi
+      prompt_file=$(build_fix_prompt "$phase_file" "$cycle" "$LAST_GATE" "$GATE_CAUSE")
     fi
+
+    sig_before=$(tree_signature)
+    run_engine "$prompt_file" "$log_file" impl || rc=$?
+
+    GATE_CAUSE=""
+    if ! gate0_engine_finished "$log_file" "$rc"; then
+      LAST_GATE="gate 0 — engine nao concluiu"
+      fail "Gate 0 vermelho"
+    elif ! gate1_diff_not_empty "$sig_before"; then
+      LAST_GATE="gate 1 — diff vazio"
+      fail "Gate 1 vermelho — nenhuma mudanca no codigo"
+    elif ! gate2_tests_pass "$LOG_DIR/${phase_file%.md}.test-${cycle}.log"; then
+      LAST_GATE="gate 2 — suite de testes do projeto"
+      fail "Gate 2 vermelho — testes do projeto falharam"
+    elif ! gate3_independent_verify "$phase_file" "$cycle"; then
+      LAST_GATE="gate 3 — verificacao independente"
+      fail "Gate 3 vermelho — implementacao incompleta"
+    else
+      local phase_duration=$(($(date +%s) - phase_start))
+      success "Phase $phase_num: $phase_title — COMPLETA ($(format_duration "$phase_duration"))"
+      if ! commit_phase "$phase_num" "$phase_title"; then
+        LAST_GATE="commit"
+        return 1
+      fi
+      mark_phase_done "$phase_file"
+      return 0
+    fi
+
+    cycle=$((cycle + 1))
   done
 
-  local phase_end
-  phase_end=$(date +%s)
-  local phase_duration=$((phase_end - phase_start))
-
-  if $phase_success; then
-    success "$phase_title — COMPLETA ($(format_duration $phase_duration))"
-
-    if git rev-parse --is-inside-work-tree &> /dev/null 2>&1; then
-      git add -A
-      git commit -m "feat: $phase_title" --allow-empty
-      log "Commit criado no git"
-    fi
-
-    echo "$phase_file" >> "$PROGRESS_FILE"
-    return 0
-  else
-    fail "$phase_title — FALHOU apos $((MAX_RETRIES + 1)) tentativas ($(format_duration $phase_duration))"
-    fail "Log disponivel em: $log_file"
-    return 1
-  fi
+  local phase_duration=$(($(date +%s) - phase_start))
+  fail "Phase $phase_num: $phase_title — FALHOU apos $MAX_CYCLES ciclos ($(format_duration "$phase_duration"))"
+  fail "Ultima causa ($LAST_GATE):"
+  printf '%s\n' "$GATE_CAUSE" | head -n 20 | sed 's/^/    /'
+  fail "Logs em: $LOG_DIR/${phase_file%.md}.*"
+  return 1
 }
 
-is_phase_done() {
-  local phase_file="$1"
-  [ -f "$PROGRESS_FILE" ] && grep -qF "$phase_file" "$PROGRESS_FILE"
-}
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+LAST_GATE=""
 
 main() {
   preflight_checks
   split_phases
+  apply_from_override
 
   local total_phases
-  total_phases=$(wc -l < "$MANIFEST")
+  total_phases=$(manifest_entries | wc -l)
+
+  if [ "$total_phases" -eq 0 ]; then
+    fail "Nenhuma fase extraida de $INPUT_FILE."
+    exit 1
+  fi
 
   if [ "$FROM_PHASE" -gt "$total_phases" ]; then
     fail "--from $FROM_PHASE excede o total de fases ($total_phases)."
@@ -433,15 +853,12 @@ main() {
   fi
 
   echo ""
-  log "$total_phases fases para implementar"
-  if [ "$FROM_PHASE" -gt 1 ]; then
-    log "Iniciando a partir da fase $FROM_PHASE (fases anteriores serao puladas)"
-  fi
+  log "$total_phases fases para implementar (engine: $ENGINE, max-cycles: $MAX_CYCLES)"
+  [ "$FROM_PHASE" -gt 1 ] && log "Iniciando a partir da fase $FROM_PHASE"
   echo ""
 
-  local num=0
-  while IFS="|" read -r file title; do
-    num=$((num + 1))
+  local file num title
+  while IFS='|' read -r file num title; do
     if [ "$num" -lt "$FROM_PHASE" ]; then
       echo -e "  ${BLUE}[$num] $title (pulada por --from)${NC}"
     elif is_phase_done "$file"; then
@@ -449,89 +866,82 @@ main() {
     else
       echo -e "  ${YELLOW}[$num] $title${NC}"
     fi
-  done < "$MANIFEST"
-
-  echo ""
-  read -p "Iniciar implementacao? (Y/n) " -n 1 -r
-  echo
-  [[ $REPLY =~ ^[Nn]$ ]] && exit 0
+  done < <(manifest_entries)
 
   local start_time
   start_time=$(date +%s)
+  echo ""
   log "Inicio: $(date '+%d/%m/%Y %H:%M:%S')"
 
-  local current=0
-  local failed_phases=()
-  local skipped_phases=()
-  local completed_phases=()
+  local seq=0
+  local failed_phases=() skipped_phases=() completed_phases=()
 
-  while IFS="|" read -r file title; do
-    current=$((current + 1))
+  while IFS='|' read -r file num title; do
+    seq=$((seq + 1))
 
-    if [ "$current" -lt "$FROM_PHASE" ]; then
-      log "Pulando $title (antes de --from $FROM_PHASE)"
+    if [ "$num" -lt "$FROM_PHASE" ]; then
+      log "Pulando Phase $num: $title (antes de --from $FROM_PHASE)"
       skipped_phases+=("$title")
       continue
     fi
 
     if is_phase_done "$file"; then
-      log "Pulando $title (ja completada)"
+      log "Pulando Phase $num: $title (ja completada)"
       skipped_phases+=("$title")
       continue
     fi
 
-    if run_phase "$file" "$title" "$current" "$total_phases"; then
+    if run_phase "$file" "$num" "$title" "$seq" "$total_phases"; then
       completed_phases+=("$title")
     else
       failed_phases+=("$title")
-      echo ""
-      warn "Fase falhou: $title"
-      read -p "Continuar para a proxima fase? (Y/n) " -n 1 -r
-      echo
-      [[ $REPLY =~ ^[Nn]$ ]] && break
+      if $KEEP_GOING; then
+        warn "--keep-going: seguindo para a proxima fase"
+        commit_wip "$num"
+      else
+        warn "Parando na primeira fase que falhou (use --keep-going para continuar)"
+        break
+      fi
     fi
-  done < "$MANIFEST"
+  done < <(manifest_entries)
 
-  local end_time
+  local end_time total_duration
   end_time=$(date +%s)
-  local total_duration=$((end_time - start_time))
+  total_duration=$((end_time - start_time))
 
   echo ""
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   log "RELATORIO FINAL (engine: $ENGINE)"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
+  local phase
   if [ ${#completed_phases[@]} -gt 0 ]; then
     echo ""
     success "Completadas (${#completed_phases[@]}):"
-    for phase in "${completed_phases[@]}"; do
-      echo -e "    ${GREEN}$phase${NC}"
-    done
+    for phase in "${completed_phases[@]}"; do printf '    %b%s%b\n' "$GREEN" "$phase" "$NC"; done
   fi
 
   if [ ${#skipped_phases[@]} -gt 0 ]; then
     echo ""
     log "Puladas (${#skipped_phases[@]}):"
-    for phase in "${skipped_phases[@]}"; do
-      echo -e "    $phase"
-    done
+    for phase in "${skipped_phases[@]}"; do printf '    %s\n' "$phase"; done
   fi
 
   if [ ${#failed_phases[@]} -gt 0 ]; then
     echo ""
     fail "Falharam (${#failed_phases[@]}):"
-    for phase in "${failed_phases[@]}"; do
-      echo -e "    ${RED}$phase${NC}"
-    done
+    for phase in "${failed_phases[@]}"; do printf '    %b%s%b\n' "$RED" "$phase" "$NC"; done
     echo ""
     fail "Verifique os logs em $LOG_DIR/"
   fi
 
   echo ""
-  log "Inicio: $(date -d @$start_time '+%d/%m/%Y %H:%M:%S')"
-  log "Fim:    $(date -d @$end_time '+%d/%m/%Y %H:%M:%S')"
-  log "Duracao total: $(format_duration $total_duration)"
+  log "Inicio: $(date -d "@$start_time" '+%d/%m/%Y %H:%M:%S')"
+  log "Fim:    $(date -d "@$end_time" '+%d/%m/%Y %H:%M:%S')"
+  log "Duracao total: $(format_duration "$total_duration")"
   echo ""
+
+  [ ${#failed_phases[@]} -eq 0 ] || exit 1
 }
 
 main
