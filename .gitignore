@@ -1,0 +1,12 @@
+# IDEs
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ralph.sh runtime artifacts
+.phases/
+
+docs

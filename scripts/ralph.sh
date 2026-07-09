@@ -176,6 +176,13 @@ split_phases() {
       continue
     fi
 
+    # Heading nivel 2 que nao e "## Phase N" (ex: "## Open Questions"):
+    # encerra a captura para nao vazar a secao para a ultima fase.
+    if [[ "$line" =~ ^##[[:space:]] ]]; then
+      current_file=""
+      continue
+    fi
+
     if [ -n "$current_file" ]; then
       echo "$line" >> "$current_file"
     fi

@@ -37,6 +37,15 @@ Before asking anything, inspect the project so you don't ask what you can detect
 
 Read enough to name the stack with real versions. If the directory is empty or pre-code, note that and derive the stack from the developer's stated intent instead (still confirm it).
 
+### If the target file already exists (re-run)
+
+Re-running this command must **update** the existing document, never rebuild it from scratch — `.spec` belongs to the developer, and manual edits there are decisions, not noise.
+
+- Read the existing `.spec/init/project-description.md` **before** interviewing. Every decision recorded in it is source of truth.
+- Interview only about **deltas**: new gaps, new scope, contradictions between the doc and what you detected in the environment. Never re-ask what the document already answers.
+- Update via **Edit**, not a full rewrite. Preserve the numbering of `## Core Workflows` (`### 1.`, `### 2.` …): new workflows take the next number at the end; never renumber existing ones — downstream artifacts reference them by number in their coverage tables.
+- A section, workflow, or concept the developer deleted stays deleted — restore it only if the developer explicitly confirms.
+
 ### 2. Interview to close gaps
 
 Understand the idea, then find what's undefined. Ask the developer about the gaps that actually matter — do not interrogate on things you can infer or that don't change the shape of the system. Focus on:
@@ -87,10 +96,27 @@ Rules for the document:
 - Keep every claim traceable to something the developer confirmed or you detected. No invented features.
 - If gaps remain unresolved, add a short `## Open Questions` section at the end listing them. Otherwise omit it.
 
-### 4. Close out
+### 4. Self-checks (run until green)
+
+After writing, run these checks. Any failure → fix the document via Edit and re-run until all pass. Never report completion with a failing check.
+
+```bash
+F=.spec/init/project-description.md
+test -f "$F"
+head -1 "$F" | grep -qE '^# .+ — Project Description$'
+grep -Fq '## Overview' "$F"
+grep -Fq '### Key Concepts' "$F"
+grep -Fq '## Tech Stack' "$F"
+grep -Fq '## Core Workflows' "$F"
+[ "$(grep -cE '^### [0-9]+\. ' "$F")" -ge 1 ]      # >=1 numbered workflow
+[ "$(grep -cE '^- \*\*[^*]+:\*\*' "$F")" -ge 1 ]   # >=1 key concept entry
+```
+
+### 5. Close out
 
 After writing, report:
 
 - The path written.
 - A 3–5 line summary of the project as captured.
+- Self-checks: all green — list any check that initially failed and how it was fixed (Red → Green).
 - Any open questions still needing the developer's decision.

@@ -5,7 +5,5 @@
   "author": {
     "name": "Beer and Code",
     "email": "administrador@beerandcode.com.br"
-  },
-  "commands": "./commands",
-  "agents": "./agents"
+  }
 }
