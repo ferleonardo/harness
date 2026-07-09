@@ -26,6 +26,7 @@
 #   --from N                 comeca na fase N (limpa do progresso as fases >= N)
 #   --keep-going             continua apos uma fase falhar (default: para)
 #   --max-cycles N           ciclos de correcao por fase (default: 3)
+#   --no-verify              desliga o gate 3 (equivale a RALPH_VERIFY=off)
 #   --test-cmd "<cmd>"       comando de teste do projeto (gate 2)
 #
 # Input (primeiro arquivo posicional). Sem argumento, resolve nesta ordem:
@@ -43,12 +44,42 @@
 #
 # Gates por fase (todos verdes -> commit; qualquer vermelho -> ciclo de correcao):
 #   0. engine terminou de verdade (claude: is_error no JSON; codex: exit code)
-#   1. diff nao vazio (alguem escreveu codigo)
+#   1. a sessao escreveu codigo? SINAL, nao veredito — uma fase ja implementada
+#      faz o engine (corretamente) nao escrever nada. Alimenta a causa do ciclo
+#      de correcao quando um gate posterior reprova.
 #   2. suite de testes do projeto, rodada PELO ralph (fora da sessao do agente)
-#   3. sessao verificadora independente, read-only, task a task
+#   3. sessao verificadora independente, read-only, task a task — o gate final,
+#      roda em toda fase (RALPH_VERIFY=always, default). RALPH_VERIFY=auto
+#      economiza: so roda quando o veredito do gate 2 nao basta — sessao que
+#      nao escreveu nada (claim "ja implementada"), ciclo de correcao, ou
+#      gate 2 desabilitado. --no-verify / RALPH_VERIFY=off desliga. No engine
+#      claude o verificador usa um modelo barato (RALPH_VERIFY_MODEL, default:
+#      haiku) — e leitura + checklist.
+#
+# Gates verdes com a arvore limpa => a fase ja estava implementada em HEAD:
+# marcada como feita, sem commit (nao ha o que commitar).
+#
+# Comando de teste (gate 2), primeira regra que resolver:
+#   1. --test-cmd "<cmd>"
+#   2. RALPH_TEST_CMD
+#   3. deteccao por manifest:
+#        Laravel Sail (artisan + vendor/bin/sail)  -> vendor/bin/sail test
+#        composer.json com scripts.test            -> composer test
+#        artisan                                   -> php artisan test
+#        package.json com scripts.test             -> npm test
+#        pytest.ini / pyproject [tool.pytest]      -> pytest
+#        go.mod                                    -> go test ./...
+#        Cargo.toml                                -> cargo test
+#   4. nada resolvido -> aviso alto + gate 2 pulado (o gate 3 segura sozinho)
+#
+# Laravel Sail: a suite roda dentro do container, entao Sail tem precedencia
+# sobre `composer test`. Containers parados -> abort no preflight (todo gate 2
+# falharia, queimando ciclos de correcao).
 #
 # Variaveis de ambiente:
 #   RALPH_TEST_CMD           comando de teste (gate 2); --test-cmd tem prioridade
+#   RALPH_VERIFY             gate 3: always (default) | auto | off
+#   RALPH_VERIFY_MODEL       modelo do verificador (default: haiku no claude)
 #   RALPH_MAX_CYCLES         ciclos de correcao por fase (default: 3)
 #   RALPH_MAX_LIMIT_WAITS    esperas consecutivas por limite, por fase (default: 20)
 #   RALPH_LIMIT_WAIT_DEFAULT fallback de espera em segundos (default: 1800)
@@ -77,6 +108,8 @@ FROM_PHASE=0
 KEEP_GOING=false
 TEST_CMD_FLAG=""
 MAX_CYCLES="${RALPH_MAX_CYCLES:-3}"
+VERIFY_MODE="${RALPH_VERIFY:-always}"
+VERIFY_MODEL=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -89,7 +122,8 @@ while [[ $# -gt 0 ]]; do
     --test-cmd)    TEST_CMD_FLAG="$2"; shift 2 ;;
     --test-cmd=*)  TEST_CMD_FLAG="${1#*=}"; shift ;;
     --keep-going)  KEEP_GOING=true; shift ;;
-    -h|--help)     sed -n '2,60p' "$0"; exit 0 ;;
+    --no-verify)   VERIFY_MODE="off"; shift ;;
+    -h|--help)     sed -n '2,70p' "$0"; exit 0 ;;
     *)             INPUT_FILE="$1"; shift ;;
   esac
 done
@@ -105,6 +139,7 @@ LIMIT_WAIT_DEFAULT="${RALPH_LIMIT_WAIT_DEFAULT:-1800}"
 LIMIT_BUFFER="${RALPH_LIMIT_BUFFER:-60}"
 
 TEST_CMD=""
+SAIL_BIN=""
 LIMIT_WAITS=0
 
 RED='\033[0;31m'
@@ -186,21 +221,87 @@ exclude_phases_dir() {
   fi
 }
 
+# Laravel Sail: a suite roda DENTRO do container. Rodar `composer test` /
+# `php artisan test` no host falha (sem PHP, sem banco, sem rede do compose).
+# Ecoa o caminho do binario sail quando o projeto usa Sail.
+detect_sail() {
+  [ -f artisan ] || return 1
+  if [ -x vendor/bin/sail ]; then
+    echo "vendor/bin/sail"
+    return 0
+  fi
+  # Sail declarado no composer.json mas vendor/ ainda nao instalado.
+  if [ -f composer.json ] && grep -qF 'laravel/sail' composer.json; then
+    echo "vendor/bin/sail"
+    return 0
+  fi
+  return 1
+}
+
+# Containers de pe? O wrapper do sail imprime "Sail is not running." e sai != 0.
+sail_running() {
+  local out rc=0
+  out=$("$SAIL_BIN" ps 2>&1) || rc=$?
+  grep -qiF 'is not running' <<< "$out" && return 1
+  [ "$rc" -ne 0 ] && return 1
+  grep -qiE '(^|[[:space:]])(Up|running)([[:space:]]|$)' <<< "$out"
+}
+
+# O comando de teste invoca o sail? Olha o executavel (1o token), nao a string
+# inteira: um caminho como /tmp/sail-fixture/test.sh nao usa sail.
+test_cmd_uses_sail() {
+  local first="${TEST_CMD%% *}"
+  [ "$(basename -- "$first")" = "sail" ]
+}
+
+# Gate 2 so tem valor se rodar de verdade. Sail com containers parados falha
+# toda fase e queima ciclos de correcao inuteis — aborta antes da 1a sessao.
+check_sail_running() {
+  [ -n "$SAIL_BIN" ] || return 0
+  test_cmd_uses_sail || return 0
+
+  if [ ! -x "$SAIL_BIN" ]; then
+    fail "Laravel Sail detectado, mas $SAIL_BIN nao existe."
+    fail "Rode a instalacao de dependencias do projeto (ex: composer install) antes."
+    exit 1
+  fi
+
+  if ! sail_running; then
+    fail "Laravel Sail detectado, mas os containers nao estao de pe."
+    fail "A suite de testes (gate 2) roda dentro do container e falharia em toda fase."
+    fail "Suba o ambiente antes de rodar o ralph:"
+    fail "    $SAIL_BIN up -d"
+    exit 1
+  fi
+
+  log "Sail: containers de pe"
+}
+
 resolve_test_cmd() {
+  SAIL_BIN="$(detect_sail || true)"
+
   if [ -n "$TEST_CMD_FLAG" ]; then
     TEST_CMD="$TEST_CMD_FLAG"
     log "Gate 2 — comando de teste (--test-cmd): $TEST_CMD"
+    check_sail_running
     return 0
   fi
 
   if [ -n "${RALPH_TEST_CMD:-}" ]; then
     TEST_CMD="$RALPH_TEST_CMD"
     log "Gate 2 — comando de teste (RALPH_TEST_CMD): $TEST_CMD"
+    check_sail_running
     return 0
   fi
 
-  if [ -f composer.json ] && grep -qE '"test"[[:space:]]*:' composer.json; then
+  # Sail vem ANTES de composer/npm: num projeto Laravel dockerizado o host nao
+  # tem PHP nem acesso ao banco, e `composer test` mentiria como gate.
+  if [ -n "$SAIL_BIN" ]; then
+    TEST_CMD="$SAIL_BIN test"
+  elif [ -f composer.json ] && grep -qE '"test"[[:space:]]*:' composer.json; then
     TEST_CMD="composer test"
+  elif [ -f artisan ]; then
+    TEST_CMD="php artisan test"
   elif [ -f package.json ] && grep -qE '"test"[[:space:]]*:' package.json; then
     TEST_CMD="npm test"
   elif [ -f pytest.ini ] || { [ -f pyproject.toml ] && grep -qF '[tool.pytest' pyproject.toml; }; then
@@ -213,9 +314,14 @@ resolve_test_cmd() {
 
   if [ -n "$TEST_CMD" ]; then
     log "Gate 2 — comando de teste (detectado): $TEST_CMD"
+    check_sail_running
   else
     warn "Gate 2 DESABILITADO: nenhum comando de teste resolvido."
-    warn "Passe --test-cmd '<cmd>' ou defina RALPH_TEST_CMD. O gate 3 (verificador) segue ativo."
+    if [ "$VERIFY_MODE" = "off" ]; then
+      warn "--no-verify tambem desligou o gate 3: NENHUMA validacao mecanica ativa."
+    else
+      warn "Passe --test-cmd '<cmd>' ou defina RALPH_TEST_CMD. O gate 3 (verificador) roda em toda fase."
+    fi
   fi
 }
 
@@ -233,6 +339,22 @@ preflight_checks() {
   if ! [[ "$MAX_CYCLES" =~ ^[0-9]+$ ]] || [ "$MAX_CYCLES" -lt 1 ]; then
     fail "Valor invalido para --max-cycles: '$MAX_CYCLES'. Use um inteiro >= 1."
     exit 1
+  fi
+
+  case "$VERIFY_MODE" in
+    auto|always|off) ;;
+    *)
+      fail "Valor invalido para RALPH_VERIFY: '$VERIFY_MODE'. Use auto, always ou off."
+      exit 1
+      ;;
+  esac
+
+  # Verificacao e leitura + checklist: nao precisa do modelo de implementacao.
+  # No codex nao ha default seguro de modelo barato — so aplica se pedido.
+  if [ -n "${RALPH_VERIFY_MODEL:-}" ]; then
+    VERIFY_MODEL="$RALPH_VERIFY_MODEL"
+  elif [[ "$ENGINE" == "claude" ]]; then
+    VERIFY_MODEL="haiku"
   fi
 
   if ! command -v "$ENGINE" &> /dev/null; then
@@ -385,6 +507,23 @@ Use os comandos de build, teste e execucao definidos por esses documentos e pelo
 tooling ja presente no repositorio. Se o projeto tiver uma ferramenta de memoria
 ou contexto configurada, use-a para entender o historico.
 PREAMBLE
+
+  # O gate 2 roda ESTE comando. Se o agente rodar outro (ex: `php artisan test`
+  # no host de um projeto Sail), ele ve verde e o gate ve vermelho.
+  if [ -n "$TEST_CMD" ]; then
+    echo
+    echo "## Comando de teste deste projeto"
+    echo "Rode a suite SEMPRE com:"
+    echo
+    echo "    $TEST_CMD"
+    echo
+    echo "Este e o comando exato usado para validar a fase. Nao use outro runner"
+    echo "nem rode os testes por fora dele."
+    if [ -n "$SAIL_BIN" ]; then
+      echo "O projeto usa Laravel Sail: artisan, composer, php e testes rodam DENTRO"
+      echo "do container, via '$SAIL_BIN <cmd>'. Nunca rode essas ferramentas no host."
+    fi
+  fi
 }
 
 build_impl_prompt() {
@@ -577,26 +716,34 @@ run_engine() {
   export RALPH_ENGINE="$ENGINE"
   export RALPH_PHASE_MAX_ATTEMPTS="$MAX_CYCLES"
 
+  local model_args=()
+  if [[ "$mode" == "verify" ]] && [ -n "$VERIFY_MODEL" ]; then
+    model_args=(--model "$VERIFY_MODEL")
+  fi
+
   while true; do
     local rc=0
 
     if [[ "$ENGINE" == "codex" ]]; then
       if [[ "$mode" == "verify" ]]; then
-        codex exec --sandbox read-only - < "$prompt_file" 2>&1 | tee "$log_file" || rc=$?
+        codex exec --sandbox read-only "${model_args[@]}" - < "$prompt_file" 2>&1 | tee "$log_file" || rc=$?
       else
         codex exec --sandbox danger-full-access - < "$prompt_file" 2>&1 | tee "$log_file" || rc=$?
       fi
     else
+      # < /dev/null: claude -p le stdin quando nao e TTY. Sem o redirect ele
+      # consome o stream de quem chamou (ex: o manifest do loop de fases).
       if [[ "$mode" == "verify" ]]; then
         env -u CLAUDECODE claude --dangerously-skip-permissions \
+          "${model_args[@]}" \
           -p "$(cat "$prompt_file")" \
           --allowedTools "Read,Glob,Grep" \
-          --output-format text 2>&1 | tee "$log_file" || rc=$?
+          --output-format text < /dev/null 2>&1 | tee "$log_file" || rc=$?
       else
         # JSON: o exit code do CLI e sinal fraco; o gate 0 le is_error.
         env -u CLAUDECODE claude --dangerously-skip-permissions \
           -p "$(cat "$prompt_file")" \
-          --output-format json 2>&1 | tee "$log_file" || rc=$?
+          --output-format json < /dev/null 2>&1 | tee "$log_file" || rc=$?
       fi
     fi
 
@@ -651,22 +798,17 @@ tree_signature() {
 }
 
 # Gate 1 — esta sessao escreveu codigo?
-# Duas condicoes: existe mudanca vs HEAD, E a sessao mudou algo (senao um ciclo
-# de correcao herdaria o diff do ciclo anterior e passaria de graca).
-gate1_diff_not_empty() {
+#
+# SINAL, nao veredito. Uma fase pode ja estar implementada antes da sessao
+# (tasks `[x]`, run anterior commitada, dev implementou a mao). Nesse caso o
+# engine correto NAO escreve nada, e reprovar aqui seria um falso negativo:
+# so os gates 2 e 3 sabem se o codigo esta completo.
+#
+# O retorno alimenta a causa do ciclo de correcao ("a sessao nao escreveu
+# nada") quando algum gate posterior reprova.
+gate1_session_wrote() {
   local sig_before="$1"
-
-  if [ -z "$(git status --porcelain)" ]; then
-    GATE_CAUSE="Nenhuma mudanca foi feita no codigo: a sessao terminou sem escrever nada. Implemente a fase de fato."
-    return 1
-  fi
-
-  if [ "$(tree_signature)" = "$sig_before" ]; then
-    GATE_CAUSE="A sessao terminou sem alterar nenhum arquivo — o codigo esta exatamente como estava antes dela. Corrija o que falta de fato."
-    return 1
-  fi
-
-  return 0
+  [ "$(tree_signature)" != "$sig_before" ]
 }
 
 # Gate 2 — a suite do projeto passa, rodada PELO ralph (fora da sessao do agente)?
@@ -679,7 +821,9 @@ gate2_tests_pass() {
 
   log "Gate 2 — rodando a suite do projeto: $TEST_CMD"
   local rc=0
-  bash -c "$TEST_CMD" > "$test_log" 2>&1 || rc=$?
+  # < /dev/null: sail test (docker compose exec) anexa stdin e consumiria o
+  # stream de quem chamou, alem de poder travar esperando input.
+  bash -c "$TEST_CMD" < /dev/null > "$test_log" 2>&1 || rc=$?
 
   if [ "$rc" -ne 0 ]; then
     GATE_CAUSE="O comando de teste do projeto ('$TEST_CMD') falhou com codigo $rc. Saida:"$'\n'"$(tail -n 200 "$test_log")"
@@ -691,9 +835,33 @@ gate2_tests_pass() {
 }
 
 # Gate 3 — sessao verificadora independente, read-only, task a task.
+# O gate final: roda em toda fase por default (always). Modo auto economiza,
+# rodando so quando o veredito do gate 2 nao basta:
+#   - a sessao nao escreveu nada (claim "ja implementada" — so a verificacao
+#     independente confirma isso sem confiar na palavra do engine)
+#   - ciclo de correcao (a fase ja reprovou uma vez)
+#   - gate 2 desabilitado (sem suite, o verificador e o unico gate)
+# GATE3_RAN diz ao caminho "ja implementada" quais gates de fato validaram HEAD.
+GATE3_RAN=0
+
 gate3_independent_verify() {
-  local phase_file="$1" cycle="$2"
+  local phase_file="$1" cycle="$2" session_wrote="$3"
   local verify_log="$LOG_DIR/${phase_file%.md}.verify-${cycle}.log"
+
+  GATE3_RAN=0
+
+  case "$VERIFY_MODE" in
+    off)
+      log "Gate 3 pulado (--no-verify)"
+      return 0
+      ;;
+    auto)
+      if [ "$cycle" -eq 1 ] && [ "$session_wrote" -eq 1 ] && [ -n "$TEST_CMD" ]; then
+        log "Gate 3 pulado: a sessao escreveu codigo e a suite passou (RALPH_VERIFY=always para rodar sempre)"
+        return 0
+      fi
+      ;;
+  esac
 
   local expected
   expected=$(grep -cE '^[[:space:]]*- \[[ x]\]' "$PHASES_DIR/$phase_file" || true)
@@ -703,7 +871,8 @@ gate3_independent_verify() {
     return 0
   fi
 
-  log "Gate 3 — sessao verificadora independente ($expected tasks)"
+  GATE3_RAN=1
+  log "Gate 3 — sessao verificadora independente ($expected tasks${VERIFY_MODEL:+, modelo: $VERIFY_MODEL})"
 
   local prompt_file
   prompt_file=$(build_verify_prompt "$phase_file" "$cycle")
@@ -794,20 +963,45 @@ run_phase() {
     run_engine "$prompt_file" "$log_file" impl || rc=$?
 
     GATE_CAUSE=""
+
+    # Gate 1 e sinal, nao veredito: uma fase ja implementada faz o engine
+    # (corretamente) nao escrever nada. Quem decide sao os gates 2 e 3.
+    # O sinal tambem alimenta o modo auto do gate 3: sessao sem escrita e
+    # exatamente o caso em que a verificacao independente e obrigatoria.
+    local no_change_note="" session_wrote=1
+    if ! gate1_session_wrote "$sig_before"; then
+      session_wrote=0
+      no_change_note="A sessao anterior terminou sem alterar nenhum arquivo. "
+      warn "Gate 1 — a sessao nao escreveu nada; validando o codigo existente"
+    fi
+
     if ! gate0_engine_finished "$log_file" "$rc"; then
       LAST_GATE="gate 0 — engine nao concluiu"
       fail "Gate 0 vermelho"
-    elif ! gate1_diff_not_empty "$sig_before"; then
-      LAST_GATE="gate 1 — diff vazio"
-      fail "Gate 1 vermelho — nenhuma mudanca no codigo"
     elif ! gate2_tests_pass "$LOG_DIR/${phase_file%.md}.test-${cycle}.log"; then
       LAST_GATE="gate 2 — suite de testes do projeto"
+      GATE_CAUSE="${no_change_note}${GATE_CAUSE}"
       fail "Gate 2 vermelho — testes do projeto falharam"
-    elif ! gate3_independent_verify "$phase_file" "$cycle"; then
+    elif ! gate3_independent_verify "$phase_file" "$cycle" "$session_wrote"; then
       LAST_GATE="gate 3 — verificacao independente"
+      GATE_CAUSE="${no_change_note}${GATE_CAUSE}"
       fail "Gate 3 vermelho — implementacao incompleta"
     else
       local phase_duration=$(($(date +%s) - phase_start))
+
+      # Gates verdes e nada a commitar => a fase ja estava implementada em HEAD
+      # (run anterior commitada, tasks [x], codigo escrito a mao).
+      if [ -z "$(git status --porcelain)" ]; then
+        success "Phase $phase_num: $phase_title — JA IMPLEMENTADA (nada a commitar)"
+        if [ "$GATE3_RAN" -eq 1 ]; then
+          log "Gates 2 e 3 verdes contra o codigo em HEAD; nenhum commit criado."
+        else
+          log "Gate 2 verde contra o codigo em HEAD; nenhum commit criado."
+        fi
+        mark_phase_done "$phase_file"
+        return 0
+      fi
+
       success "Phase $phase_num: $phase_title — COMPLETA ($(format_duration "$phase_duration"))"
       if ! commit_phase "$phase_num" "$phase_title"; then
         LAST_GATE="commit"
@@ -825,6 +1019,13 @@ run_phase() {
   fail "Ultima causa ($LAST_GATE):"
   printf '%s\n' "$GATE_CAUSE" | head -n 20 | sed 's/^/    /'
   fail "Logs em: $LOG_DIR/${phase_file%.md}.*"
+
+  # O trabalho parcial fica na arvore; o preflight da proxima execucao exige
+  # arvore limpa. Diga o que fazer em vez de deixar o dev descobrir no abort.
+  if [ -n "$(git status --porcelain)" ]; then
+    warn "O trabalho parcial desta fase ficou na arvore. Antes de re-rodar o ralph:"
+    warn "    commite (o ralph revalida a fase e segue) ou 'git checkout -- . && git clean -fd' (descarta)"
+  fi
   return 1
 }
 
@@ -876,7 +1077,10 @@ main() {
   local seq=0
   local failed_phases=() skipped_phases=() completed_phases=()
 
-  while IFS='|' read -r file num title; do
+  # fd 3, nunca stdin: comandos do corpo (claude -p, sail test / docker compose
+  # exec) leem stdin quando nao e TTY e engoliriam o resto do manifest — o run
+  # pararia apos a primeira fase.
+  while IFS='|' read -r -u 3 file num title; do
     seq=$((seq + 1))
 
     if [ "$num" -lt "$FROM_PHASE" ]; then
@@ -903,7 +1107,7 @@ main() {
         break
       fi
     fi
-  done < <(manifest_entries)
+  done 3< <(manifest_entries)
 
   local end_time total_duration
   end_time=$(date +%s)

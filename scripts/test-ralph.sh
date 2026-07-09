@@ -67,11 +67,17 @@ bump() {
   echo "$n"
 }
 
+model=""
+
 if [ "$name" = "claude" ]; then
+  # claude -p real le stdin quando nao e TTY: se o ralph nao redirecionar
+  # < /dev/null, o mock engole o stream de quem chamou (ex: manifest do loop).
+  [ -t 0 ] || cat > /dev/null
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -p) prompt="$2"; shift 2 ;;
       --allowedTools) verify=1; shift 2 ;;
+      --model) model="$2"; shift 2 ;;
       --output-format) shift 2 ;;
       *) shift ;;
     esac
@@ -80,6 +86,7 @@ else
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --sandbox) [ "$2" = "read-only" ] && verify=1; shift 2 ;;
+      --model) model="$2"; shift 2 ;;
       *) shift ;;
     esac
   done
@@ -88,10 +95,26 @@ fi
 
 grep -q '^RALPH_VERIFY' <<< "$prompt" && verify=1
 
+# Grava o modelo pedido para a sessao verificadora (assert do teste de modelo).
+if [ "$verify" -eq 1 ] && [ -n "$model" ]; then
+  echo "$model" > "$state/verify_model"
+fi
+
 # --- verificador independente ------------------------------------------------
+# Verifica o CODIGO REAL, como o verificador de verdade: sem arquivo de
+# implementacao no repo, a fase esta incompleta.
 if [ "$verify" -eq 1 ]; then
   n=$(bump verify_calls)
   tasks=$(grep -cE '^[[:space:]]*- \[[ x]\]' <<< "$prompt")
+
+  implemented=0
+  compgen -G "src/impl-*.txt" > /dev/null 2>&1 && implemented=1
+
+  if [ "$implemented" -eq 0 ]; then
+    for i in $(seq 1 "$tasks"); do echo "TASK $i: INCOMPLETE — nenhum codigo encontrado"; done
+    exit 0
+  fi
+
   if [ "$scenario" = "verify-incomplete-once" ] && [ "$n" -eq 1 ]; then
     echo "TASK 1: INCOMPLETE — o arquivo nao foi criado"
     for i in $(seq 2 "$tasks"); do echo "TASK $i: DONE"; done
@@ -123,9 +146,10 @@ case "$scenario" in
 esac
 
 # stall-after-red: escreve no 1o ciclo (teste vermelho), depois trava sem
-# escrever nada. O diff herdado do ciclo 1 nao pode passar o gate 1 de graca.
+# escrever nada. already-done: o codigo ja existe em HEAD, o engine nao escreve.
 write=1
 [ "$scenario" = "empty-diff" ] && write=0
+[ "$scenario" = "already-done" ] && write=0
 [ "$scenario" = "stall-after-red" ] && [ "$n" -gt 1 ] && write=0
 
 if [ "$write" -eq 1 ]; then
@@ -156,6 +180,8 @@ make_testcmd() {
 set -uo pipefail
 state="${MOCK_STATE:?}"
 scenario="${MOCK_SCENARIO:-ok}"
+# sail test real (docker compose exec) anexa stdin: mesmo risco do claude -p.
+[ -t 0 ] || cat > /dev/null
 f="$state/test_calls"; n=0
 [ -f "$f" ] && n=$(cat "$f")
 n=$((n + 1)); echo "$n" > "$f"
@@ -200,6 +226,39 @@ Projeto de teste.
 - nenhuma
 '
 
+# Fixture de projeto Laravel + Sail. `sail ps` responde conforme SAIL_UP.
+make_sail_fixture() {
+  local repo="$1" up="$2"
+
+  touch "$repo/artisan"
+  cat > "$repo/composer.json" <<'JSON'
+{
+  "require-dev": { "laravel/sail": "^1.0" },
+  "scripts": { "test": "phpunit" }
+}
+JSON
+
+  mkdir -p "$repo/vendor/bin"
+  cat > "$repo/vendor/bin/sail" <<SAILMOCK
+#!/usr/bin/env bash
+set -uo pipefail
+if [ "\${1:-}" = "ps" ]; then
+  if [ "$up" = "up" ]; then
+    echo "NAME                IMAGE            STATUS"
+    echo "proj-laravel.test-1 sail-8.3/app     Up 2 hours"
+    exit 0
+  fi
+  echo "Sail is not running."
+  exit 1
+fi
+if [ "\${1:-}" = "test" ]; then
+  exec "\$MOCK_TEST_CMD"
+fi
+exit 0
+SAILMOCK
+  chmod +x "$repo/vendor/bin/sail"
+}
+
 # new_case <nome> -> ecoa o diretorio do repo fixture
 new_case() {
   local name="$1"
@@ -230,8 +289,11 @@ run_ralph() {
     PATH="$dir/bin:$PATH" \
     MOCK_STATE="$dir/state" \
     MOCK_SCENARIO="$scenario" \
+    MOCK_TEST_CMD="$dir/test.sh" \
     RALPH_LIMIT_WAIT_DEFAULT=1 \
     RALPH_LIMIT_BUFFER=1 \
+    RALPH_VERIFY="${CASE_VERIFY:-}" \
+    RALPH_VERIFY_MODEL="${CASE_VERIFY_MODEL:-}" \
       bash "$RALPH" "$@" > "$dir/out.log" 2>&1
   ) || rc=$?
   echo "$rc"
@@ -256,7 +318,7 @@ if case_enabled ok-first; then
   assert_contains "$d/repo/.phases/.progress" "phase-02.md" "progresso registra phase-02"
   assert_eq "feat(phase-2): Feature" "$(git -C "$d/repo" log -1 --pretty=%s)" "mensagem de commit da ultima fase"
   assert_eq 2 "$(cat "$d/state/impl_calls")" "1 sessao de implementacao por fase (2 fases)"
-  assert_eq 2 "$(cat "$d/state/verify_calls")" "1 sessao verificadora por fase"
+  assert_eq 2 "$(cat "$d/state/verify_calls")" "gate 3 (default always) rodou em toda fase"
 fi
 
 # ---------------------------------------------------------------------------
@@ -279,17 +341,19 @@ if case_enabled test-red-once; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Diff vazio -> falha sem commit
+# 3. Engine nao escreve nada e a fase esta incompleta -> falha sem commit
+#    (gate 1 sinaliza; quem reprova e o verificador, contra o codigo real)
 # ---------------------------------------------------------------------------
 if case_enabled empty-diff; then
-  header "3. diff vazio -> falha sem commit"
+  header "3. engine nao escreve nada + fase incompleta -> falha sem commit"
   d=$(new_case empty-diff)
   rc=$(run_ralph "$d" empty-diff --engine claude --test-cmd "$d/test.sh" --max-cycles 2)
   assert_eq 1 "$rc" "exit 1"
   assert_eq 1 "$(commits "$d")" "nenhum commit criado (sem --allow-empty)"
-  assert_contains "$d/out.log" "Gate 1 vermelho" "gate 1 reportado vermelho"
+  assert_contains "$d/out.log" "a sessao nao escreveu nada" "gate 1 sinalizou a sessao vazia"
+  assert_contains "$d/out.log" "Gate 3 vermelho" "verificador reprovou contra o codigo real"
   assert_contains "$d/out.log" "Parando na primeira fase que falhou" "politica default = parar"
-  test -f "$d/state/verify_calls" && bad "verificador nao deve rodar apos gate 1" || ok "verificador nao roda apos gate 1"
+  assert_contains "$d/repo/.phases/prompts/phase-01.cycle-2.txt" "sem alterar nenhum arquivo" "causa do ciclo cita a sessao vazia"
 fi
 
 # ---------------------------------------------------------------------------
@@ -415,17 +479,176 @@ if case_enabled bad-format; then
 fi
 
 # ---------------------------------------------------------------------------
-# 12. Ciclo de correcao que nao escreve nada -> gate 1 vermelho
-#     (o diff herdado do ciclo anterior nao pode passar de graca)
+# 12. Ciclo de correcao que nao escreve nada, mas o codigo do ciclo anterior
+#     esta completo e verde -> a fase passa (o verificador manda, nao o diff)
 # ---------------------------------------------------------------------------
 if case_enabled stall-after-red; then
-  header "12. ciclo de correcao sem escrever nada -> gate 1 vermelho"
+  header "12. ciclo sem escrita + codigo completo -> gate 3 decide, fase passa"
   d=$(new_case stall-after-red)
   rc=$(run_ralph "$d" stall-after-red --engine claude --test-cmd "$d/test.sh" --max-cycles 2)
-  assert_eq 1 "$rc" "exit 1"
-  assert_eq 1 "$(commits "$d")" "nenhum commit criado"
-  assert_contains "$d/out.log" "Gate 1 vermelho" "gate 1 pegou a sessao que nao alterou nada"
+  assert_eq 0 "$rc" "exit 0"
+  # o mock so escreve na 1a sessao: fase 1 commita apos o ciclo 2; fase 2 cai
+  # no caminho "ja implementada" (o verificador ve o codigo e aprova)
+  assert_eq 2 "$(commits "$d")" "1 commit (fase 1); fase 2 nao tinha o que commitar"
   assert_contains "$d/out.log" "Gate 2 vermelho" "o ciclo comecou por um gate 2 vermelho"
+  assert_contains "$d/out.log" "a sessao nao escreveu nada" "gate 1 sinalizou a sessao vazia do ciclo 2"
+  assert_contains "$d/out.log" "feat(phase-1)" "fase 1 commitada apos o ciclo de correcao"
+fi
+
+# ---------------------------------------------------------------------------
+# 17. Fase JA implementada em HEAD (run anterior commitada) -> reconhecida
+#     sem commit, sem falhar. Regressao do bug real: o engine nao escreve
+#     porque nao ha o que escrever, e o gate 1 reprovava isso.
+# ---------------------------------------------------------------------------
+if case_enabled already-done; then
+  header "17. fase ja implementada em HEAD -> reconhecida sem commit"
+  d=$(new_case already-done)
+  # simula a run anterior: codigo implementado e commitado a mao, progress vazio
+  mkdir -p "$d/repo/src"
+  echo "impl previo" > "$d/repo/src/impl-1.txt"
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "feat: trabalho da run anterior"
+  before=$(commits "$d")
+
+  rc=$(run_ralph "$d" already-done --engine claude --test-cmd "$d/test.sh" --max-cycles 1)
+  assert_eq 0 "$rc" "exit 0 (nao reprova fase ja implementada)"
+  assert_contains "$d/out.log" "JA IMPLEMENTADA" "reconheceu a fase como feita"
+  assert_eq "$before" "$(commits "$d")" "nenhum commit criado (nada a commitar)"
+  assert_contains "$d/repo/.phases/.progress" "phase-01.md" "progresso registra a fase"
+  assert_contains "$d/repo/.phases/.progress" "phase-02.md" "progresso registra a fase seguinte"
+fi
+
+# ---------------------------------------------------------------------------
+# 18. Fase falhou -> avisa que o trabalho parcial ficou na arvore
+# ---------------------------------------------------------------------------
+if case_enabled dirty-after-fail; then
+  header "18. fase falhou com trabalho na arvore -> instrui o dev"
+  d=$(new_case dirty-after-fail)
+  # verify-incomplete-once com 1 ciclo: escreve, testes verdes, verificador reprova
+  rc=$(run_ralph "$d" verify-incomplete-once --engine claude --test-cmd "$d/test.sh" --max-cycles 1)
+  assert_eq 1 "$rc" "exit 1"
+  assert_eq 1 "$(commits "$d")" "nenhum commit"
+  assert_contains "$d/out.log" "trabalho parcial desta fase ficou na arvore" "avisou sobre a arvore suja"
+  assert_contains "$d/out.log" "git clean -fd" "deu a saida de descarte"
+fi
+
+# ---------------------------------------------------------------------------
+# 19. --no-verify desliga o gate 3 mesmo no caminho suspeito (sessao sem
+#     escrita). Escolha explicita do dev: o ralph confia no gate 2 sozinho.
+# ---------------------------------------------------------------------------
+if case_enabled no-verify; then
+  header "19. --no-verify desliga o gate 3 ate no caminho suspeito"
+  d=$(new_case no-verify)
+  rc=$(run_ralph "$d" empty-diff --engine claude --test-cmd "$d/test.sh" --max-cycles 1 --no-verify)
+  assert_eq 0 "$rc" "exit 0 (gate 2 verde decide sozinho)"
+  assert_contains "$d/out.log" "Gate 3 pulado (--no-verify)" "skip explicito logado"
+  assert_contains "$d/out.log" "Gate 2 verde contra o codigo em HEAD" "mensagem nao menciona gate 3 (nao rodou)"
+  test -f "$d/state/verify_calls" && bad "nenhuma sessao verificadora gasta" || ok "nenhuma sessao verificadora gasta"
+fi
+
+# ---------------------------------------------------------------------------
+# 20. RALPH_VERIFY=auto (opt-in): caminho feliz (sessao escreveu + suite verde)
+#     pula o gate 3; a fase ainda commita.
+# ---------------------------------------------------------------------------
+if case_enabled verify-auto; then
+  header "20. RALPH_VERIFY=auto pula o gate 3 no caminho feliz"
+  d=$(new_case verify-auto)
+  rc=$(CASE_VERIFY=auto run_ralph "$d" ok --engine claude --test-cmd "$d/test.sh")
+  assert_eq 0 "$rc" "exit 0"
+  assert_eq 3 "$(commits "$d")" "fases commitadas"
+  assert_contains "$d/out.log" "Gate 3 pulado: a sessao escreveu codigo" "skip logado com a causa"
+  test -f "$d/state/verify_calls" && bad "nenhuma sessao verificadora gasta" || ok "nenhuma sessao verificadora gasta"
+fi
+
+# ---------------------------------------------------------------------------
+# 21. Verificador roda com modelo barato: haiku por default no claude,
+#     RALPH_VERIFY_MODEL sobrepoe.
+# ---------------------------------------------------------------------------
+if case_enabled verify-model; then
+  header "21. verificador usa modelo barato (haiku default, env sobrepoe)"
+  d=$(new_case verify-model)
+  # fase ja implementada em HEAD: sessao nao escreve -> gate 3 roda em auto
+  mkdir -p "$d/repo/src"
+  echo "impl previo" > "$d/repo/src/impl-1.txt"
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "feat: trabalho previo"
+  rc=$(run_ralph "$d" already-done --engine claude --test-cmd "$d/test.sh" --max-cycles 1)
+  assert_eq 0 "$rc" "exit 0"
+  assert_eq "haiku" "$(cat "$d/state/verify_model" 2>/dev/null)" "verify chamado com --model haiku"
+  assert_contains "$d/out.log" "modelo: haiku" "log do gate 3 informa o modelo"
+
+  d2=$(new_case verify-model-override)
+  mkdir -p "$d2/repo/src"
+  echo "impl previo" > "$d2/repo/src/impl-1.txt"
+  git -C "$d2/repo" add -A && git -C "$d2/repo" commit -q -m "feat: trabalho previo"
+  rc=$(CASE_VERIFY_MODEL=sonnet run_ralph "$d2" already-done --engine claude --test-cmd "$d2/test.sh" --max-cycles 1)
+  assert_eq 0 "$rc" "exit 0 (override)"
+  assert_eq "sonnet" "$(cat "$d2/state/verify_model" 2>/dev/null)" "RALPH_VERIFY_MODEL sobrepoe o default"
+fi
+
+# ---------------------------------------------------------------------------
+# 13. Laravel Sail com containers de pe -> gate 2 usa `vendor/bin/sail test`
+#     (e NAO `composer test`, que rodaria no host sem PHP nem banco)
+# ---------------------------------------------------------------------------
+if case_enabled sail-up; then
+  header "13. Laravel Sail up -> gate 2 roda sail test"
+  d=$(new_case sail-up)
+  make_sail_fixture "$d/repo" up
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: sail"
+  rc=$(run_ralph "$d" ok --engine claude)   # sem --test-cmd: exercita a deteccao
+  assert_eq 0 "$rc" "exit 0"
+  assert_contains "$d/out.log" "comando de teste (detectado): vendor/bin/sail test" "detectou sail test"
+  assert_not_contains "$d/out.log" "composer test" "composer test nao foi escolhido"
+  assert_contains "$d/out.log" "Sail: containers de pe" "checou containers no preflight"
+  # base = 2 commits (fixture + chore: sail) + 2 fases
+  assert_eq 4 "$(commits "$d")" "fases commitadas (gate 2 rodou de verdade)"
+  assert_eq 2 "$(cat "$d/state/test_calls")" "a suite rodou 1x por fase, via sail"
+  # o agente precisa saber qual runner usar, senao roda php artisan test no host
+  assert_contains "$d/repo/.phases/prompts/phase-01.cycle-1.txt" "vendor/bin/sail test" "prompt informa o comando de teste"
+  assert_contains "$d/repo/.phases/prompts/phase-01.cycle-1.txt" "Nunca rode essas ferramentas no host" "prompt avisa sobre o container"
+fi
+
+# ---------------------------------------------------------------------------
+# 14. Sail com containers parados -> abort no preflight, zero tokens
+# ---------------------------------------------------------------------------
+if case_enabled sail-down; then
+  header "14. Laravel Sail down -> abort no preflight"
+  d=$(new_case sail-down)
+  make_sail_fixture "$d/repo" down
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: sail"
+  rc=$(run_ralph "$d" ok --engine claude)
+  assert_eq 1 "$rc" "exit 1"
+  assert_contains "$d/out.log" "containers nao estao de pe" "abortou com a causa"
+  assert_contains "$d/out.log" "vendor/bin/sail up -d" "instruiu como subir o ambiente"
+  assert_eq 2 "$(commits "$d")" "nenhum commit de fase"
+  test -f "$d/state/impl_calls" && bad "nenhuma sessao de engine iniciada" || ok "nenhuma sessao de engine iniciada"
+fi
+
+# ---------------------------------------------------------------------------
+# 15. --test-cmd sobrepoe a deteccao de Sail
+# ---------------------------------------------------------------------------
+if case_enabled sail-override; then
+  header "15. --test-cmd sobrepoe a deteccao de Sail"
+  d=$(new_case sail-override)
+  make_sail_fixture "$d/repo" down   # containers parados, mas o cmd nao usa sail
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: sail"
+  rc=$(run_ralph "$d" ok --engine claude --test-cmd "$d/test.sh")
+  assert_eq 0 "$rc" "exit 0 (nao checa containers para cmd sem sail)"
+  assert_contains "$d/out.log" "comando de teste (--test-cmd)" "override respeitado"
+  assert_eq 4 "$(commits "$d")" "fases commitadas"
+fi
+
+# ---------------------------------------------------------------------------
+# 16. Laravel sem Sail -> composer test (regressao: nao vira sail test)
+# ---------------------------------------------------------------------------
+if case_enabled laravel-no-sail; then
+  header "16. Laravel sem Sail -> composer test"
+  d=$(new_case laravel-no-sail)
+  touch "$d/repo/artisan"
+  printf '{ "scripts": { "test": "phpunit" } }\n' > "$d/repo/composer.json"
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: laravel"
+  # nao roda ate o fim: so precisamos do preflight resolvendo o comando
+  run_ralph "$d" empty-diff --engine claude --max-cycles 1 > /dev/null
+  assert_contains "$d/out.log" "comando de teste (detectado): composer test" "sem sail -> composer test"
+  assert_not_contains "$d/out.log" "Sail" "nao mencionou Sail"
 fi
 
 # ---------------------------------------------------------------------------
