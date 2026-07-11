@@ -6,7 +6,9 @@ allowed-tools: Read, Write, Edit, Glob, Grep, Bash, AskUserQuestion, WebSearch
 
 # init:project-description
 
-You are helping a developer turn a rough idea into a **clear, structured project description**. This document is the first artifact of the project spec. It is written *before* code and becomes the shared source of truth for what is being built and why.
+You are helping a developer turn a rough idea into a **clear, structured project description**. 
+This document is the first artifact of the project spec. It is written *before* code and becomes the shared source 
+of truth for what is being built and why.
 
 The developer's initial idea (may be empty):
 

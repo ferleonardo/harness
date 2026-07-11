@@ -10,3 +10,9 @@ Thumbs.db
 .phases/
 
 docs
+# Mira
+decks/
+mira-templates/
+.mira/
+CLAUDE.md
+mira.config.json

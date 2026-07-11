@@ -56,7 +56,7 @@ O `ralph.sh` é um script bash independente — copie ou referencie `scripts/ral
 
 ### `/init` — roteador da cadeia init
 
-Diagnóstico puro: mostra o estado dos artefatos de `.spec/init/` (presente / ausente / desatualizado) e indica o próximo comando a rodar. Nunca escreve nada.
+Mostra o estado dos artefatos de `.spec/init/` (presente / ausente / desatualizado) e **invoca o próximo comando da cadeia** (um passo por execução — re-rode `/init` para avançar). Não escreve nada por conta própria; toda autoria vive no comando `init:*` invocado.
 
 A cadeia, em ordem:
 

@@ -58,7 +58,7 @@ Commands are namespaced: `/bc-harness:init`, `/bc-harness:plan`, etc. (abbreviat
 
 ### `/init` — init chain router
 
-Pure diagnostic: shows the state of the `.spec/init/` artifacts (present / absent / stale) and points at the next command to run. Never writes anything.
+Shows the state of the `.spec/init/` artifacts (present / absent / stale) and **invokes the next command in the chain** (one hop per run — re-run `/init` to advance). Writes nothing itself; all authoring lives in the invoked `init:*` command.
 
 The chain, in order:
 
