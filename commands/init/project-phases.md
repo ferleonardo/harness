@@ -1,6 +1,6 @@
 ---
 description: Read the project description, user stories, database schema, and any design specs, then plan the build into numbered, agent-ready phases with tasks, acceptance criteria, and feature tests at .spec/init/project-phases.md
-argument-hint: [optional focus area or extra context]
+argument-hint: "[optional focus area or extra context]"
 allowed-tools: Read, Write, Edit, Glob, Grep, Bash, AskUserQuestion
 ---
 

@@ -1,6 +1,6 @@
 ---
 description: Interview the developer, discover the stack, and produce a structured project description at .spec/init/project-description.md
-argument-hint: [one-line idea of the project]
+argument-hint: "[one-line idea of the project]"
 allowed-tools: Read, Write, Edit, Glob, Grep, Bash, AskUserQuestion, WebSearch
 ---
 
