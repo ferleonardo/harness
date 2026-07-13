@@ -1,6 +1,6 @@
 ---
 description: Read the project description and derive structured, testable user stories at .spec/init/user-stories.md
-argument-hint: [optional focus area or extra context]
+argument-hint: "[optional focus area or extra context]"
 allowed-tools: Read, Write, Edit, Glob, Grep, Bash, AskUserQuestion
 ---
 
